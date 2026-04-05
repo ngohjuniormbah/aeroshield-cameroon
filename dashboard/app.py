@@ -13,8 +13,7 @@ DATASET_CANDIDATES = [
 ]
 
 st.title("AeroShield Cameroon")
-st.caption(
-    "Climate-driven air-quality risk forecasting for Cameroon using a virtual sensor network.")
+st.caption("Climate-driven air-quality risk forecasting for Cameroon using a virtual sensor network.")
 
 
 def find_dataset() -> Path:
@@ -51,18 +50,15 @@ def build_virtual_aqri(df: pd.DataFrame) -> pd.DataFrame:
     ]
     df = ensure_numeric(df, numeric_cols)
 
-    # Fill missing values by city median, then global median
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = df.groupby("city")[col].transform(
-                lambda s: s.fillna(s.median()))
+            df[col] = df.groupby("city")[col].transform(lambda s: s.fillna(s.median()))
             df[col] = df[col].fillna(df[col].median())
 
-    # Normalize helpers
     def norm(col: str) -> pd.Series:
         if col not in df.columns:
             return pd.Series(0.0, index=df.index)
-        s = df[col].astype(float)
+        s = pd.to_numeric(df[col], errors="coerce").astype(float)
         mn, mx = s.min(), s.max()
         if pd.isna(mn) or pd.isna(mx) or mx == mn:
             return pd.Series(0.0, index=df.index)
@@ -76,7 +72,6 @@ def build_virtual_aqri(df: pd.DataFrame) -> pd.DataFrame:
     sunshine = norm("sunshine_duration")
     evap = norm("et0_fao_evapotranspiration")
 
-    # Virtual Air Quality Risk Index
     aqri = (
         100
         * (
@@ -111,13 +106,14 @@ def load_data():
     if "time" not in df.columns:
         raise KeyError("The dataset must contain a 'time' column.")
 
-    df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df = df.dropna(subset=["time"]).copy()
-
     required_cols = ["city", "region", "latitude", "longitude"]
     for col in required_cols:
         if col not in df.columns:
             raise KeyError(f"Missing required column: {col}")
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = ensure_numeric(df, ["latitude", "longitude"])
+    df = df.dropna(subset=["time", "latitude", "longitude"]).copy()
 
     df = build_virtual_aqri(df)
 
@@ -175,8 +171,7 @@ with st.sidebar:
             .tolist()
         )
 
-    selected_city = st.selectbox(
-        "City", filtered_cities if filtered_cities else cities)
+    selected_city = st.selectbox("City", filtered_cities if filtered_cities else cities)
 
     st.header("Model performance")
     st.metric("R²", f"{metrics['r2']:.2f}")
@@ -188,8 +183,7 @@ st.write(f"Most recent dataset date: **{latest_snapshot_date.date()}**")
 
 display_snapshot = latest_snapshot.copy()
 if selected_region != "All":
-    display_snapshot = display_snapshot[display_snapshot["region"]
-                                        == selected_region]
+    display_snapshot = display_snapshot[display_snapshot["region"] == selected_region]
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Cities shown", len(display_snapshot))
@@ -220,6 +214,9 @@ with tab1:
     if display_snapshot.empty:
         st.warning("No data available for this region.")
     else:
+        center_lat = float(display_snapshot["latitude"].mean())
+        center_lon = float(display_snapshot["longitude"].mean())
+
         fig_map = px.scatter_mapbox(
             display_snapshot,
             lat="latitude",
@@ -230,10 +227,11 @@ with tab1:
             hover_data={
                 "region": True,
                 "aqri": ":.2f",
-                "latitude": False,
-                "longitude": False,
+                "latitude": ":.4f",
+                "longitude": ":.4f",
             },
             zoom=4.6,
+            center={"lat": center_lat, "lon": center_lon},
             height=600,
             mapbox_style="carto-positron",
             title="City-level Air Quality Risk Index (AQRI)"
@@ -315,8 +313,7 @@ with tab4:
         "sunshine_duration",
         "et0_fao_evapotranspiration",
     ]
-    available_features = [
-        c for c in candidate_features if c in city_df.columns]
+    available_features = [c for c in candidate_features if c in city_df.columns]
 
     if not available_features:
         st.warning("No climate feature columns available for comparison.")
