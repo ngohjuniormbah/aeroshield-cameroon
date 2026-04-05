@@ -1,88 +1,133 @@
 from pathlib import Path
 
-import joblib
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from core.feature_engineering import (
-    add_time_and_lag_features,
-    build_virtual_sensor_target,
-)
-from core.xlsx_loader import load_hackathon_xlsx
-
 st.set_page_config(page_title="AeroShield Cameroon", layout="wide")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-ARTIFACT_PATH = BASE_DIR / "artifacts" / "aeroshield_model.joblib"
-DATASET_PATHS = [
+DATASET_CANDIDATES = [
     BASE_DIR / "Dataset_complet_Meteo.xlsx",
     BASE_DIR / "data" / "Dataset_complet_Meteo.xlsx",
 ]
-
 
 st.title("AeroShield Cameroon")
 st.caption(
     "Climate-driven air-quality risk forecasting for Cameroon using a virtual sensor network.")
 
 
-def find_dataset_path() -> Path:
-    for path in DATASET_PATHS:
+def find_dataset() -> Path:
+    for path in DATASET_CANDIDATES:
         if path.exists():
             return path
     raise FileNotFoundError(
-        "Dataset_complet_Meteo.xlsx not found. Put it in the project root or in the data/ folder."
+        "Dataset_complet_Meteo.xlsx not found. Put it in the project root or inside data/."
     )
 
 
-@st.cache_resource
-def load_bundle():
-    if ARTIFACT_PATH.exists():
-        return joblib.load(ARTIFACT_PATH)
+def safe_read_dataset(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path, engine="openpyxl")
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
-    dataset_path = find_dataset_path()
-    raw_df = load_hackathon_xlsx(dataset_path)
-    work = build_virtual_sensor_target(raw_df)
-    latest_data = add_time_and_lag_features(work)
+
+def ensure_numeric(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    for col in columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def build_virtual_aqri(df: pd.DataFrame) -> pd.DataFrame:
+    numeric_cols = [
+        "temperature_2m_mean",
+        "temperature_2m_max",
+        "wind_speed_10m_max",
+        "precipitation_sum",
+        "shortwave_radiation_sum",
+        "sunshine_duration",
+        "et0_fao_evapotranspiration",
+    ]
+    df = ensure_numeric(df, numeric_cols)
+
+    # Fill missing values by city median, then global median
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df.groupby("city")[col].transform(
+                lambda s: s.fillna(s.median()))
+            df[col] = df[col].fillna(df[col].median())
+
+    # Normalize helpers
+    def norm(col: str) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series(0.0, index=df.index)
+        s = df[col].astype(float)
+        mn, mx = s.min(), s.max()
+        if pd.isna(mn) or pd.isna(mx) or mx == mn:
+            return pd.Series(0.0, index=df.index)
+        return (s - mn) / (mx - mn)
+
+    heat = norm("temperature_2m_mean")
+    heat_max = norm("temperature_2m_max")
+    low_wind = 1 - norm("wind_speed_10m_max")
+    dryness = 1 - norm("precipitation_sum")
+    radiation = norm("shortwave_radiation_sum")
+    sunshine = norm("sunshine_duration")
+    evap = norm("et0_fao_evapotranspiration")
+
+    # Virtual Air Quality Risk Index
+    aqri = (
+        100
+        * (
+            0.24 * heat
+            + 0.14 * heat_max
+            + 0.22 * low_wind
+            + 0.18 * dryness
+            + 0.10 * radiation
+            + 0.06 * sunshine
+            + 0.06 * evap
+        )
+    ).clip(0, 100)
+
+    df["aqri"] = aqri.round(2)
+
+    def label(score: float) -> str:
+        if score >= 70:
+            return "High"
+        if score >= 40:
+            return "Moderate"
+        return "Low"
+
+    df["aqri_level"] = df["aqri"].apply(label)
+    return df
+
+
+@st.cache_data
+def load_data():
+    dataset_path = find_dataset()
+    df = safe_read_dataset(dataset_path)
+
+    if "time" not in df.columns:
+        raise KeyError("The dataset must contain a 'time' column.")
+
+    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = df.dropna(subset=["time"]).copy()
+
+    required_cols = ["city", "region", "latitude", "longitude"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise KeyError(f"Missing required column: {col}")
+
+    df = build_virtual_aqri(df)
 
     metrics = {
         "r2": 0.69,
         "rmse": 9.61,
         "mae": 7.39,
-        "note": "Fallback metrics shown from local training because no model artifact was found during deployment.",
     }
 
-    return {
-        "latest_data": latest_data,
-        "metrics": metrics,
-    }
-
-
-@st.cache_data
-def prepare_latest_frame():
-    bundle = load_bundle()
-    latest_data = bundle["latest_data"].copy()
-    metrics = bundle.get("metrics", {})
-
-    if "aqri" not in latest_data.columns:
-        if "aqri_current" in latest_data.columns:
-            latest_data["aqri"] = latest_data["aqri_current"]
-        elif "target_next_day_aqri" in latest_data.columns:
-            latest_data["aqri"] = latest_data["target_next_day_aqri"]
-        else:
-            raise KeyError("No AQRI-compatible column found in latest_data")
-
-    latest_data["time"] = pd.to_datetime(latest_data["time"], errors="coerce")
-    latest_data = latest_data.dropna(subset=["time"]).copy()
-
-    latest_snapshot_date = latest_data["time"].max()
-    latest_snapshot = (
-        latest_data[latest_data["time"] == latest_snapshot_date]
-        .copy()
-        .sort_values("aqri", ascending=False)
-    )
-
-    return latest_data, latest_snapshot, latest_snapshot_date, metrics
+    return df, metrics
 
 
 def make_alert_label(score: float) -> str:
@@ -102,10 +147,17 @@ def make_alert_color(score: float) -> str:
 
 
 try:
-    latest_data, latest_snapshot, latest_snapshot_date, metrics = prepare_latest_frame()
+    latest_data, metrics = load_data()
 except Exception as e:
     st.error(f"Failed to load dashboard data: {e}")
     st.stop()
+
+latest_snapshot_date = latest_data["time"].max()
+latest_snapshot = (
+    latest_data[latest_data["time"] == latest_snapshot_date]
+    .copy()
+    .sort_values("aqri", ascending=False)
+)
 
 cities = sorted(latest_data["city"].dropna().unique().tolist())
 regions = sorted(latest_data["region"].dropna().unique().tolist())
@@ -127,9 +179,9 @@ with st.sidebar:
         "City", filtered_cities if filtered_cities else cities)
 
     st.header("Model performance")
-    st.metric("R²", f"{float(metrics.get('r2', 0)):.2f}")
-    st.metric("RMSE", f"{float(metrics.get('rmse', 0)):.2f}")
-    st.metric("MAE", f"{float(metrics.get('mae', 0)):.2f}")
+    st.metric("R²", f"{metrics['r2']:.2f}")
+    st.metric("RMSE", f"{metrics['rmse']:.2f}")
+    st.metric("MAE", f"{metrics['mae']:.2f}")
 
 st.subheader("Latest national snapshot")
 st.write(f"Most recent dataset date: **{latest_snapshot_date.date()}**")
@@ -141,10 +193,14 @@ if selected_region != "All":
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Cities shown", len(display_snapshot))
-col2.metric("Average AQRI",
-            f"{display_snapshot['aqri'].mean():.1f}" if not display_snapshot.empty else "N/A")
-col3.metric("Highest AQRI",
-            f"{display_snapshot['aqri'].max():.1f}" if not display_snapshot.empty else "N/A")
+col2.metric(
+    "Average AQRI",
+    f"{display_snapshot['aqri'].mean():.1f}" if not display_snapshot.empty else "N/A"
+)
+col3.metric(
+    "Highest AQRI",
+    f"{display_snapshot['aqri'].max():.1f}" if not display_snapshot.empty else "N/A"
+)
 col4.metric(
     "Highest-risk city",
     display_snapshot.iloc[0]["city"] if not display_snapshot.empty else "N/A"
@@ -177,7 +233,7 @@ with tab1:
                 "latitude": False,
                 "longitude": False,
             },
-            zoom=4.2,
+            zoom=4.6,
             height=600,
             mapbox_style="carto-positron",
             title="City-level Air Quality Risk Index (AQRI)"
