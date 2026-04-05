@@ -112,7 +112,7 @@ def load_data():
             raise KeyError(f"Missing required column: {col}")
 
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df = ensure_numeric(df, ["latitude", "longitude"])
+    df = ensure_numeric(df, ["latitude", "longitude", "target_next_day_aqri"])
     df = df.dropna(subset=["time", "latitude", "longitude"]).copy()
 
     df = build_virtual_aqri(df)
@@ -200,6 +200,19 @@ col4.metric(
     display_snapshot.iloc[0]["city"] if not display_snapshot.empty else "N/A"
 )
 
+st.markdown("### Tomorrow's risk leaders")
+if "target_next_day_aqri" in display_snapshot.columns and not display_snapshot.empty:
+    tomorrow_df = display_snapshot.copy().sort_values("target_next_day_aqri", ascending=False).head(5)
+    tomorrow_df["Tomorrow Alert"] = tomorrow_df["target_next_day_aqri"].apply(
+        lambda x: f"{make_alert_color(x)} {make_alert_label(x)}" if pd.notna(x) else "N/A"
+    )
+    st.dataframe(
+        tomorrow_df[["city", "region", "target_next_day_aqri", "Tomorrow Alert"]].rename(
+            columns={"target_next_day_aqri": "Predicted AQRI (Tomorrow)"}
+        ),
+        use_container_width=True
+    )
+
 st.markdown("---")
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -273,11 +286,36 @@ with tab3:
         st.warning("No history available for the selected city.")
     else:
         latest_score = city_df.iloc[-1]["aqri"]
+
         st.markdown(
             f"**Current status for {selected_city}:** "
             f"{make_alert_color(latest_score)} {make_alert_label(latest_score)} "
             f"(**AQRI: {latest_score:.1f}**)"
         )
+
+        st.markdown("### Tomorrow Prediction")
+
+        if "target_next_day_aqri" in city_df.columns:
+            predicted = pd.to_numeric(
+                city_df.iloc[-1]["target_next_day_aqri"], errors="coerce"
+            )
+
+            if pd.notna(predicted):
+                delta_value = predicted - latest_score
+
+                c1, c2 = st.columns(2)
+                c1.metric(
+                    "Predicted AQRI (Tomorrow)",
+                    f"{predicted:.1f}",
+                    delta=f"{delta_value:.1f}"
+                )
+                c2.markdown(
+                    f"### {make_alert_color(predicted)} {make_alert_label(predicted)}"
+                )
+            else:
+                st.info("Tomorrow prediction is not available for this city.")
+        else:
+            st.info("Tomorrow prediction column not found in the dataset.")
 
         fig_line = px.line(
             city_df,
@@ -293,6 +331,7 @@ with tab3:
                 "precipitation_sum",
                 "wind_speed_10m_max",
                 "shortwave_radiation_sum",
+                "target_next_day_aqri",
             ] if col in city_df.columns
         ]
         if climate_cols:
@@ -336,3 +375,6 @@ st.write(
 - 🔴 **High**: elevated air quality risk, action may be needed  
 """
 )
+
+st.markdown("---")
+st.caption("Built for IndabaX Cameroon 2026 • AeroShield Cameroon")
